@@ -1,6 +1,6 @@
 /**
  * Flymax WhatsApp Gateway (Baileys)
- * ---------------------------------
+ * ------------------------------------------------
  * Pequeno serviço Node que mantém a sessão do WhatsApp aberta (QR Code) e
  * conversa com o CRM por HTTP. Deve rodar fora do app (Railway, Render, Fly,
  * VPS) porque o Baileys precisa de um processo Node persistente.
@@ -18,7 +18,8 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
-} from "@whiskeysockets/baileys";
+  fetchLatestBaileysVersion,
+} from "baileys";
 
 const TOKEN = process.env.GATEWAY_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
@@ -26,18 +27,32 @@ const PORT = process.env.PORT || 8787;
 const SESSION_DIR = process.env.SESSION_DIR || "./session";
 if (!TOKEN) throw new Error("GATEWAY_TOKEN é obrigatório");
 
-const logger = pino({ level: "warn" });
+const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 let sock = null;
 let state = { status: "desconectado", qr: null, phone: null };
 
 async function start() {
+  // Versão do protocolo: env override > versão mais recente do WA Web > padrão da lib
+  let version;
+  try {
+    if (process.env.WA_BAILEYS_VERSION) {
+      version = process.env.WA_BAILEYS_VERSION.split(",").map(Number);
+    } else {
+      version = (await fetchLatestBaileysVersion()).version;
+    }
+  } catch (e) {
+    console.log("[conn] fetchLatestBaileysVersion falhou, usando versão padrão:", e?.message);
+  }
+  console.log("[conn] versão do protocolo:", version ?? "padrão da lib");
+
   const { state: auth, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  sock = makeWASocket({ auth, logger, browser: ["Flymax CRM", "Chrome", "1.0"] });
+  sock = makeWASocket({ auth, logger, browser: ["Flymax CRM", "Chrome", "1.0"], version });
   state.status = "conectando";
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (u) => {
+    console.log("[conn]", JSON.stringify({ connection: u.connection, qr: !!u.qr, code: u.lastDisconnect?.error?.output?.statusCode, msg: u.lastDisconnect?.error?.message }));
     if (u.qr) state.qr = await qrcode.toDataURL(u.qr);
     if (u.connection === "open") {
       state = { status: "conectado", qr: null, phone: sock.user?.id?.split(":")[0] ?? null };
