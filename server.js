@@ -264,10 +264,15 @@ app.post("/disconnect", async (_r, res) => {
 
 app.post("/send", async (req, res) => {
   if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
-  const { to, text } = req.body || {};
-  const jid = String(to).includes("@") ? String(to) : `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
-  const sent = await sock.sendMessage(jid, { text });
-  res.json({ externalId: sent?.key?.id ?? null });
+  try {
+    const { to, text } = req.body || {};
+    const jid = String(to).includes("@") ? String(to) : `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
+    const sent = await sock.sendMessage(jid, { text });
+    res.json({ externalId: sent?.key?.id ?? null });
+  } catch (e) {
+    console.error("[send] falhou:", e?.message);
+    res.status(500).json({ error: e?.message || "falha ao enviar" });
+  }
 });
 
 // Reagir a uma mensagem com emoji, igual ao WhatsApp (emoji vazio remove a reação).
@@ -275,35 +280,48 @@ app.post("/send-reaction", async (req, res) => {
   if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, messageId, emoji, fromMe } = req.body || {};
   if (!to || !messageId) return res.status(400).json({ error: "to e messageId são obrigatórios" });
-  const digits = String(to).replace(/\D/g, "");
-  const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
-  const sent = await sock.sendMessage(jid, {
-    react: { text: emoji || "", key: { remoteJid: jid, id: String(messageId), fromMe: Boolean(fromMe) } },
-  });
-  res.json({ externalId: sent?.key?.id ?? null });
+  try {
+    const digits = String(to).replace(/\D/g, "");
+    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
+    const sent = await sock.sendMessage(jid, {
+      react: { text: emoji || "", key: { remoteJid: jid, id: String(messageId), fromMe: Boolean(fromMe) } },
+    });
+    res.json({ externalId: sent?.key?.id ?? null });
+  } catch (e) {
+    console.error("[send-reaction] falhou:", e?.message);
+    res.status(500).json({ error: e?.message || "falha ao reagir" });
+  }
 });
 
 app.post("/send-document", async (req, res) => {
   if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, filename, base64, caption, mimetype } = req.body || {};
   if (!to || !filename || !base64) return res.status(400).json({ error: "to, filename e base64 são obrigatórios" });
-  const digits = String(to).replace(/\D/g, "");
-  const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
-  const buf = Buffer.from(base64, "base64");
-  const mime = mimetype || "application/pdf";
-  const isAudio = mime.startsWith("audio/");
-  const sent = await sock.sendMessage(
-    jid,
-    mime.startsWith("image/")
-      ? { image: buf, mimetype: mime, caption: caption || undefined }
-      : mime.startsWith("video/")
-        ? { video: buf, mimetype: mime, caption: caption || undefined }
-        : isAudio
-          // ptt:true força mensagem de voz nativa, nunca documento/anexo.
-          ? { audio: buf, mimetype: mime, ptt: true, fileName: undefined }
-          : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
-  );
-  res.json({ externalId: sent?.key?.id ?? null });
+  try {
+    const digits = String(to).replace(/\D/g, "");
+    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
+    const buf = Buffer.from(base64, "base64");
+    const mime = mimetype || "application/pdf";
+    const isAudio = mime.startsWith("audio/");
+    // O WhatsApp só toca áudio em Opus: o navegador grava em webm/opus,
+    // então rotulamos como ogg/opus para virar mensagem de voz nativa.
+    const audioMime = "audio/ogg; codecs=opus";
+    const sent = await sock.sendMessage(
+      jid,
+      mime.startsWith("image/")
+        ? { image: buf, mimetype: mime, caption: caption || undefined }
+        : mime.startsWith("video/")
+          ? { video: buf, mimetype: mime, caption: caption || undefined }
+          : isAudio
+            // ptt:true força mensagem de voz nativa, nunca documento/anexo.
+            ? { audio: buf, mimetype: audioMime, ptt: true, fileName: undefined }
+            : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
+    );
+    res.json({ externalId: sent?.key?.id ?? null });
+  } catch (e) {
+    console.error("[send-document] falhou:", e?.message);
+    res.status(500).json({ error: e?.message || "falha ao enviar o anexo" });
+  }
 });
 
 // Escuta em TODAS as portas possíveis (PORT do Railway + 8787) para eliminar
