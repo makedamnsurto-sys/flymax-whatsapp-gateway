@@ -1,6 +1,6 @@
 /**
  * Flymax WhatsApp Gateway (Baileys)
- * ---------------------------------
+ * ------------------------------------------------------------------------
  * Pequeno serviço Node que mantém a sessão do WhatsApp aberta (QR Code) e
  * conversa com o CRM por HTTP. Deve rodar fora do app (Railway, Render, Fly,
  * VPS) porque o Baileys precisa de um processo Node persistente.
@@ -11,6 +11,7 @@
  *   PORT           - porta HTTP (default 8787)
  *   SESSION_DIR    - pasta da sessão (default ./session)
  */
+import http from "http";
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
@@ -25,9 +26,11 @@ const TOKEN = process.env.GATEWAY_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const PORT = process.env.PORT || 8787;
 const SESSION_DIR = process.env.SESSION_DIR || "./session";
-if (!TOKEN) throw new Error("GATEWAY_TOKEN é obrigatório");
+// Não derruba o processo se faltar variável: o servidor sobe mesmo assim
+// e responde com erro claro nas rotas protegidas.
+const CONFIG_OK = Boolean(TOKEN);
 
-console.log("[boot] Flymax WhatsApp Gateway iniciando... PORT=%s SESSION_DIR=%s", process.env.PORT || 8787, process.env.SESSION_DIR || "./session");
+console.log("[boot] Flymax WhatsApp Gateway iniciando... PORT=%s SESSION_DIR=%s config_ok=%s", process.env.PORT || 8787, process.env.SESSION_DIR || "./session", CONFIG_OK);
 
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 let sock = null;
@@ -138,6 +141,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
+  if (!CONFIG_OK) return res.status(503).json({ error: "GATEWAY_TOKEN não configurada" });
   if (req.get("x-gateway-token") !== TOKEN) return res.status(401).json({ error: "token inválido" });
   next();
 });
@@ -167,5 +171,18 @@ app.post("/send", async (req, res) => {
   res.json({ externalId: sent?.key?.id ?? null });
 });
 
-app.listen(PORT, () => console.log(`Flymax WhatsApp Gateway on :${PORT}`));
-start().catch((e) => console.error(e));
+// Escuta em TODAS as portas possíveis (PORT do Railway + 8787) para eliminar
+// qualquer desalinhamento entre a porta do aplicativo e a porta do domínio.
+function listenOn(port, label) {
+  const server = http.createServer(app);
+  server.on("error", (e) => console.log(`[http] ${label}:${port} indisponível —`, e.message));
+  server.listen(port, "0.0.0.0", () => console.log(`Flymax WhatsApp Gateway on :${port} (${label})`));
+}
+listenOn(Number(process.env.PORT) || 8787, "PORT");
+if (Number(process.env.PORT) !== 8787) listenOn(8787, "fixa");
+
+// Nada pode derrubar o servidor HTTP: erros do WhatsApp ficam apenas no log.
+process.on("uncaughtException", (e) => console.error("[erro não tratado]", e?.message));
+process.on("unhandledRejection", (e) => console.error("[promise rejeitada]", e?.message ?? e));
+
+start().catch((e) => console.error("[start] falhou:", e?.message));
