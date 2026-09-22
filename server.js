@@ -12,6 +12,7 @@
  *   SESSION_DIR    - pasta da sessão (default ./session)
  */
 import http from "http";
+import fs from "fs";
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
@@ -35,17 +36,43 @@ console.log("[boot] Flymax WhatsApp Gateway iniciando... PORT=%s SESSION_DIR=%s 
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 let sock = null;
 let state = { status: "desconectado", qr: null, phone: null };
+let starting = false;
+let activeSessionDir = SESSION_DIR;
 
 async function loadAuthState() {
   try {
-    return await useMultiFileAuthState(SESSION_DIR);
+    const auth = await useMultiFileAuthState(SESSION_DIR);
+    activeSessionDir = SESSION_DIR;
+    return auth;
   } catch (e) {
     console.log("[boot] SESSION_DIR %s indisponível (%s) — usando ./session", SESSION_DIR, e?.message);
+    activeSessionDir = "./session";
     return await useMultiFileAuthState("./session");
   }
 }
 
+/** Apaga a sessão salva para que o próximo connect gere um QR Code novo. */
+function clearSession() {
+  for (const dir of new Set([activeSessionDir, SESSION_DIR, "./session"])) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      console.log("[sessao] não foi possível apagar %s: %s", dir, e?.message);
+    }
+  }
+}
+
 async function start() {
+  if (starting) return;
+  starting = true;
+  try {
+    await boot();
+  } finally {
+    starting = false;
+  }
+}
+
+async function boot() {
   // Versão do protocolo: env override > versão mais recente do WA Web > padrão da lib
   let version;
   try {
@@ -67,14 +94,24 @@ async function start() {
 
   sock.ev.on("connection.update", async (u) => {
     console.log("[conn]", JSON.stringify({ connection: u.connection, qr: !!u.qr, code: u.lastDisconnect?.error?.output?.statusCode, msg: u.lastDisconnect?.error?.message }));
-    if (u.qr) state.qr = await qrcode.toDataURL(u.qr);
+    if (u.qr) {
+      state.qr = await qrcode.toDataURL(u.qr);
+      state.status = "conectando";
+    }
     if (u.connection === "open") {
       state = { status: "conectado", qr: null, phone: sock.user?.id?.split(":")[0] ?? null };
     }
     if (u.connection === "close") {
       const code = u.lastDisconnect?.error?.output?.statusCode;
       state = { status: "desconectado", qr: null, phone: null };
-      if (code !== DisconnectReason.loggedOut) setTimeout(start, 3000);
+      if (code === DisconnectReason.loggedOut || code === 401 || code === 403) {
+        // Sessão inválida: sem apagar os arquivos o Baileys nunca gera um QR novo.
+        console.log("[conn] sessão inválida (%s) — apagando credenciais e gerando novo QR", code);
+        clearSession();
+        setTimeout(start, 1500);
+      } else {
+        setTimeout(start, 3000);
+      }
     }
   });
 
@@ -248,8 +285,21 @@ app.use((req, res, next) => {
 app.get("/health", (_r, res) => res.json({ ok: true }));
 app.get("/status", (_r, res) => res.json(state));
 
-app.post("/connect", async (_r, res) => {
-  if (!sock || state.status === "desconectado") await start();
+app.post("/connect", async (req, res) => {
+  // reset=1 força apagar a sessão antiga e pedir um QR Code novo.
+  if (req.query.reset === "1" || req.body?.reset === true) {
+    try {
+      await sock?.logout();
+    } catch {}
+    sock = null;
+    clearSession();
+    state = { status: "desconectado", qr: null, phone: null };
+  }
+  if (!sock || state.status === "desconectado") start();
+  // Espera até 20s o QR Code aparecer, para o CRM já receber a imagem pronta.
+  for (let i = 0; i < 40 && !state.qr && state.status !== "conectado"; i += 1) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
   res.json(state);
 });
 
@@ -258,6 +308,7 @@ app.post("/disconnect", async (_r, res) => {
     await sock?.logout();
   } catch {}
   sock = null;
+  clearSession();
   state = { status: "desconectado", qr: null, phone: null };
   res.json(state);
 });
