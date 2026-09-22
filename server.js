@@ -87,19 +87,22 @@ async function boot() {
   console.log("[conn] versão do protocolo:", version ?? "padrão da lib");
 
   const { state: auth, saveCreds } = await loadAuthState();
-  sock = makeWASocket({ auth, logger, browser: ["Flymax CRM", "Chrome", "1.0"], version });
-  state.status = "conectando";
+  const mySock = makeWASocket({ auth, logger, browser: ["Flymax CRM", "Chrome", "1.0"], version });
+  sock = mySock;
+  if (state.status !== "conectado") state.status = "conectando";
 
-  sock.ev.on("creds.update", saveCreds);
+  mySock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (u) => {
+  mySock.ev.on("connection.update", async (u) => {
+    // Eventos de sockets antigos não podem sobrescrever a conexão ativa.
+    if (sock !== mySock) return;
     console.log("[conn]", JSON.stringify({ connection: u.connection, qr: !!u.qr, code: u.lastDisconnect?.error?.output?.statusCode, msg: u.lastDisconnect?.error?.message }));
-    if (u.qr) {
+    if (u.qr && state.status !== "conectado") {
       state.qr = await qrcode.toDataURL(u.qr);
       state.status = "conectando";
     }
     if (u.connection === "open") {
-      state = { status: "conectado", qr: null, phone: sock.user?.id?.split(":")[0] ?? null };
+      state = { status: "conectado", qr: null, phone: mySock.user?.id?.split(":")[0] ?? null };
     }
     if (u.connection === "close") {
       const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -115,7 +118,7 @@ async function boot() {
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  mySock.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const m of messages) {
       // Mensagens enviadas no próprio celular costumam chegar como "append",
       // enquanto novas mensagens recebidas chegam como "notify".
@@ -131,7 +134,7 @@ async function boot() {
 
   // Algumas versões do WhatsApp entregam reações fora de messages.upsert.
   // A chave do evento é a da mensagem reagida — inclusive quando ela é nossa (fromMe).
-  sock.ev.on("messages.reaction", async (reactions) => {
+  mySock.ev.on("messages.reaction", async (reactions) => {
     for (const item of reactions || []) {
       const reaction = item?.reaction;
       const eventKey = item?.key;
@@ -295,7 +298,7 @@ app.post("/connect", async (req, res) => {
     clearSession();
     state = { status: "desconectado", qr: null, phone: null };
   }
-  if (!sock || state.status === "desconectado") start();
+  if (!sock?.user) start();
   // Espera até 20s o QR Code aparecer, para o CRM já receber a imagem pronta.
   for (let i = 0; i < 40 && !state.qr && state.status !== "conectado"; i += 1) {
     await new Promise((r) => setTimeout(r, 500));
@@ -314,7 +317,7 @@ app.post("/disconnect", async (_r, res) => {
 });
 
 app.post("/send", async (req, res) => {
-  if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
+  if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   try {
     const { to, text } = req.body || {};
     const jid = String(to).includes("@") ? String(to) : `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
@@ -328,7 +331,7 @@ app.post("/send", async (req, res) => {
 
 // Reagir a uma mensagem com emoji, igual ao WhatsApp (emoji vazio remove a reação).
 app.post("/send-reaction", async (req, res) => {
-  if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
+  if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, messageId, emoji, fromMe } = req.body || {};
   if (!to || !messageId) return res.status(400).json({ error: "to e messageId são obrigatórios" });
   try {
@@ -345,7 +348,7 @@ app.post("/send-reaction", async (req, res) => {
 });
 
 app.post("/send-document", async (req, res) => {
-  if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
+  if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, filename, base64, caption, mimetype } = req.body || {};
   if (!to || !filename || !base64) return res.status(400).json({ error: "to, filename e base64 são obrigatórios" });
   try {
