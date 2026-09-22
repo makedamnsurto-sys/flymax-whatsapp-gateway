@@ -1,6 +1,6 @@
 /**
  * Flymax WhatsApp Gateway (Baileys)
- * ------------------------------------------------------------------------
+ * ---------------------------------
  * Pequeno serviço Node que mantém a sessão do WhatsApp aberta (QR Code) e
  * conversa com o CRM por HTTP. Deve rodar fora do app (Railway, Render, Fly,
  * VPS) porque o Baileys precisa de um processo Node persistente.
@@ -91,9 +91,11 @@ async function start() {
 async function toInbound(m) {
   const msg = m.message;
   if (!msg) return null;
-  const from = (m.key.remoteJid || "").split("@")[0];
+  const jid = m.key.remoteJid || "";
+  const from = jid.split("@")[0];
   const base = {
     from,
+    jid,
     name: m.pushName || undefined,
     externalId: m.key.id,
     timestamp: new Date((Number(m.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),
@@ -166,8 +168,23 @@ app.post("/disconnect", async (_r, res) => {
 app.post("/send", async (req, res) => {
   if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, text } = req.body || {};
-  const jid = `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
+  const jid = String(to).includes("@") ? String(to) : `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
   const sent = await sock.sendMessage(jid, { text });
+  res.json({ externalId: sent?.key?.id ?? null });
+});
+
+app.post("/send-document", async (req, res) => {
+  if (state.status !== "conectado") return res.status(409).json({ error: "WhatsApp desconectado" });
+  const { to, filename, base64, caption } = req.body || {};
+  if (!to || !filename || !base64) return res.status(400).json({ error: "to, filename e base64 são obrigatórios" });
+  const digits = String(to).replace(/\D/g, "");
+  const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
+  const sent = await sock.sendMessage(jid, {
+    document: Buffer.from(base64, "base64"),
+    mimetype: "application/pdf",
+    fileName: filename,
+    caption: caption || undefined,
+  });
   res.json({ externalId: sent?.key?.id ?? null });
 });
 
