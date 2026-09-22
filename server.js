@@ -1,6 +1,6 @@
 /**
  * Flymax WhatsApp Gateway (Baileys)
- * ------------------------------------------------
+ * ---------------------------------
  * Pequeno serviço Node que mantém a sessão do WhatsApp aberta (QR Code) e
  * conversa com o CRM por HTTP. Deve rodar fora do app (Railway, Render, Fly,
  * VPS) porque o Baileys precisa de um processo Node persistente.
@@ -27,9 +27,20 @@ const PORT = process.env.PORT || 8787;
 const SESSION_DIR = process.env.SESSION_DIR || "./session";
 if (!TOKEN) throw new Error("GATEWAY_TOKEN é obrigatório");
 
+console.log("[boot] Flymax WhatsApp Gateway iniciando... PORT=%s SESSION_DIR=%s", process.env.PORT || 8787, process.env.SESSION_DIR || "./session");
+
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 let sock = null;
 let state = { status: "desconectado", qr: null, phone: null };
+
+async function loadAuthState() {
+  try {
+    return await useMultiFileAuthState(SESSION_DIR);
+  } catch (e) {
+    console.log("[boot] SESSION_DIR %s indisponível (%s) — usando ./session", SESSION_DIR, e?.message);
+    return await useMultiFileAuthState("./session");
+  }
+}
 
 async function start() {
   // Versão do protocolo: env override > versão mais recente do WA Web > padrão da lib
@@ -45,7 +56,7 @@ async function start() {
   }
   console.log("[conn] versão do protocolo:", version ?? "padrão da lib");
 
-  const { state: auth, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { state: auth, saveCreds } = await loadAuthState();
   sock = makeWASocket({ auth, logger, browser: ["Flymax CRM", "Chrome", "1.0"], version });
   state.status = "conectando";
 
