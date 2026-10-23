@@ -303,18 +303,13 @@ async function postGroup(m) {
   let msg = m.message;
   if (!msg) return;
   for (let d = 0; d < 5; d += 1) {
-    const nested =
-      msg.ephemeralMessage?.message ||
-      msg.viewOnceMessage?.message ||
-      msg.viewOnceMessageV2?.message ||
-      msg.viewOnceMessageV2Extension?.message ||
-      msg.editedMessage?.message;
+    const nested = msg.ephemeralMessage?.message || msg.viewOnceMessage?.message || msg.viewOnceMessageV2?.message || msg.editedMessage?.message;
     if (!nested) break;
     msg = nested;
   }
   if (msg.protocolMessage || msg.reactionMessage || msg.senderKeyDistributionMessage && Object.keys(msg).length === 1) return;
   const type = msg.imageMessage ? "image" : msg.videoMessage ? "video" : msg.audioMessage ? "audio" : msg.documentMessage ? "document" : msg.stickerMessage ? "sticker" : "text";
-  const body = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || msg.documentMessage?.fileName ~y "";
+  const body = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || msg.documentMessage?.fileName || "";
   if (type === "text" && !body) return;
   const groupJid = String(m.key.remoteJid);
   const participant = String(m.key.participantAlt || m.key.participant || "");
@@ -331,7 +326,6 @@ async function postGroup(m) {
     timestamp: new Date((Number(m.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),
   });
 }
-
 
 async function post(payload) {
   if (!WEBHOOK_URL) return;
@@ -360,10 +354,10 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_r, res) => res.json({ ok: true }));
-app.get("/status", (_r, res) => res.json(state);
-
+app.get("/status", (_r, res) => res.json(state));
 
 app.post("/connect", async (req, res) => {
+  // reset=1 força apagar a sessão antiga e pedir um QR Code novo.
   if (req.query.reset === "1" || req.body?.reset === true) {
     try {
       await sock?.logout();
@@ -373,6 +367,7 @@ app.post("/connect", async (req, res) => {
     state = { status: "desconectado", qr: null, phone: null };
   }
   if (!sock?.user) start();
+  // Espera até 20s o QR Code aparecer, para o CRM já receber a imagem pronta.
   for (let i = 0; i < 40 && !state.qr && state.status !== "conectado"; i += 1) {
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -389,6 +384,8 @@ app.post("/disconnect", async (_r, res) => {
   res.json(state);
 });
 
+// Lista os grupos (inclusive os da Comunidade Flymax) para o CRM disparar promoções.
+// Só leitura: mensagens de grupo continuam fora do Inbox.
 app.get("/groups", async (_r, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   try {
@@ -409,7 +406,6 @@ app.get("/groups", async (_r, res) => {
   }
 });
 
-
 app.post("/send", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   try {
@@ -423,7 +419,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-
+// Reagir a uma mensagem com emoji, igual ao WhatsApp (emoji vazio remove a reação).
 app.post("/send-reaction", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, messageId, emoji, fromMe } = req.body || {};
@@ -436,7 +432,7 @@ app.post("/send-reaction", async (req, res) => {
     });
     res.json({ externalId: sent?.key?.id ?? null });
   } catch (e) {
-    console.error("[send-reactionj�!hou:", e?.message);
+    console.error("[send-reaction] falhou:", e?.message);
     res.status(500).json({ error: e?.message || "falha ao reagir" });
   }
 });
@@ -447,10 +443,12 @@ app.post("/send-document", async (req, res) => {
   if (!to || !filename || !base64) return res.status(400).json({ error: "to, filename e base64 são obrigatórios" });
   try {
     const digits = String(to).replace(/\D/g, "");
-    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net';
+    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
     const buf = Buffer.from(base64, "base64");
     const mime = mimetype || "application/pdf";
     const isAudio = mime.startsWith("audio/");
+    // O WhatsApp só toca áudio em Opus: o navegador grava em webm/opus,
+    // então rotulamos como ogg/opus para virar mensagem de voz nativa.
     const audioMime = "audio/ogg; codecs=opus";
     const sent = await sock.sendMessage(
       jid,
@@ -459,24 +457,28 @@ app.post("/send-document", async (req, res) => {
         : mime.startsWith("video/")
           ? { video: buf, mimetype: mime, caption: caption || undefined }
           : isAudio
+            // ptt:true força mensagem de voz nativa, nunca documento/anexo.
             ? { audio: buf, mimetype: audioMime, ptt: true, fileName: undefined }
             : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
     );
-    res.json({ `externalId: sent?.key?.id ?? null });
+    res.json({ externalId: sent?.key?.id ?? null });
   } catch (e) {
     console.error("[send-document] falhou:", e?.message);
     res.status(500).json({ error: e?.message || "falha ao enviar o anexo" });
   }
 });
 
+// Escuta em TODAS as portas possíveis (PORT do Railway + 8787) para eliminar
+// qualquer desalinhamento entre a porta do aplicativo e a porta do domínio.
 function listenOn(port, label) {
   const server = http.createServer(app);
   server.on("error", (e) => console.log(`[http] ${label}:${port} indisponível —`, e.message));
-  server.listen(port, "0.0.0.0", () => console.log(`Flymax WhatsApp Gateway on ${port} (${label})`));
+  server.listen(port, "0.0.0.0", () => console.log(`Flymax WhatsApp Gateway on :${port} (${label})`));
 }
 listenOn(Number(process.env.PORT) || 8787, "PORT");
 if (Number(process.env.PORT) !== 8787) listenOn(8787, "fixa");
 
+// Nada pode derrubar o servidor HTTP: erros do WhatsApp ficam apenas no log.
 process.on("uncaughtException", (e) => console.error("[erro não tratado]", e?.message));
 process.on("unhandledRejection", (e) => console.error("[promise rejeitada]", e?.message ?? e));
 
