@@ -123,12 +123,21 @@ async function boot() {
       // Mensagens enviadas no próprio celular costumam chegar como "append",
       // enquanto novas mensagens recebidas chegam como "notify".
       if (type !== "notify" && !(type === "append" && m.key.fromMe)) continue;
+      // Grupos vão só para o "Inbox dos grupos" da Comunidade, nunca para o Inbox de clientes.
+      if (String(m.key?.remoteJid || "").endsWith("@g.us")) {
+        await postGroup(m);
+        continue;
+      }
+      // Status/stories, listas de transmissão, canais e grupos nunca entram no CRM.
+      if (isNotConversation(m.key) || m.broadcast) continue;
       const jid = messageJid(m.key);
       if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue;
       const payload = await toInbound(m);
       // Mensagens enviadas pelo próprio número (celular ou conversa consigo mesmo)
-      // também são espelhadas no CRM, marcadas como saída.
-      if (payload) await post({ ...payload, fromMe: Boolean(m.key.fromMe) });
+      // também são espelhadas no CRM, marcadas como saída. chatJid deixa o CRM
+      // recusar status/stories mesmo que o gateway esteja desatualizado.
+      if (payload)
+        await post({ ...payload, chatJid: String(m.key.remoteJid || ""), fromMe: Boolean(m.key.fromMe) });
     }
   });
 
@@ -138,6 +147,7 @@ async function boot() {
     for (const item of reactions || []) {
       const reaction = item?.reaction;
       const eventKey = item?.key;
+      if (isNotConversation(eventKey) || isNotConversation(reaction?.key)) continue;
       const jid = messageJid(eventKey) || messageJid(reaction?.key);
       if (!jid || jid.endsWith("@g.us")) continue;
       await post({
@@ -242,6 +252,23 @@ async function toInbound(m) {
 }
 
 /** Prefere o número telefônico alternativo quando o WhatsApp usa um JID @lid. */
+/** Status/stories, canais, listas de transmissão e grupos não são atendimentos. */
+function isNotConversation(key = {}) {
+  const chats = [key?.remoteJid, key?.remoteJidAlt].map((v) => String(v || ""));
+  const notChat = chats.some(
+    (chat) =>
+      chat === "status@broadcast" ||
+      chat.endsWith("@broadcast") ||
+      chat.endsWith("@newsletter") ||
+      chat.endsWith("@g.us"),
+  );
+  // Só @lid sem telefone alternativo: o mesmo cliente chega pelo número real.
+  const lidOnly =
+    String(key?.remoteJid || "").endsWith("@lid") &&
+    !String(key?.remoteJidAlt || "").endsWith("@s.whatsapp.net");
+  return notChat || lidOnly;
+}
+
 function messageJid(key = {}) {
   const candidates = [key.remoteJidAlt, key.remoteJid, key.participantAlt, key.participant].filter(Boolean);
   return candidates.find((value) => String(value).endsWith("@s.whatsapp.net")) || candidates[0] || "";
@@ -258,6 +285,53 @@ async function media(m, mime) {
     return { mediaUrl: null, mediaSize: null, mediaMime: mime };
   }
 }
+
+const groupNames = new Map();
+async function groupName(jid) {
+  if (groupNames.has(jid)) return groupNames.get(jid);
+  try {
+    const meta = await sock.groupMetadata(jid);
+    groupNames.set(jid, meta?.subject || jid);
+  } catch {
+    groupNames.set(jid, jid);
+  }
+  return groupNames.get(jid);
+}
+
+/** Envia ao CRM um resumo leve da mensagem do grupo (texto/legenda, sem baixar mídia). */
+async function postGroup(m) {
+  let msg = m.message;
+  if (!msg) return;
+  for (let d = 0; d < 5; d += 1) {
+    const nested =
+      msg.ephemeralMessage?.message ||
+      msg.viewOnceMessage?.message ||
+      msg.viewOnceMessageV2?.message ||
+      msg.viewOnceMessageV2Extension?.message ||
+      msg.editedMessage?.message;
+    if (!nested) break;
+    msg = nested;
+  }
+  if (msg.protocolMessage || msg.reactionMessage || msg.senderKeyDistributionMessage && Object.keys(msg).length === 1) return;
+  const type = msg.imageMessage ? "image" : msg.videoMessage ? "video" : msg.audioMessage ? "audio" : msg.documentMessage ? "document" : msg.stickerMessage ? "sticker" : "text";
+  const body = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || msg.documentMessage?.fileName ~y "";
+  if (type === "text" && !body) return;
+  const groupJid = String(m.key.remoteJid);
+  const participant = String(m.key.participantAlt || m.key.participant || "");
+  await post({
+    kind: "group",
+    groupJid,
+    groupName: await groupName(groupJid),
+    from: participant.split("@")[0],
+    name: m.pushName || null,
+    fromMe: Boolean(m.key.fromMe),
+    type,
+    body,
+    externalId: m.key.id,
+    timestamp: new Date((Number(m.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),
+  });
+}
+
 
 async function post(payload) {
   if (!WEBHOOK_URL) return;
@@ -286,10 +360,10 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_r, res) => res.json({ ok: true }));
-app.get("/status", (_r, res) => res.json(state));
+app.get("/status", (_r, res) => res.json(state);
+
 
 app.post("/connect", async (req, res) => {
-  // reset=1 força apagar a sessão antiga e pedir um QR Code novo.
   if (req.query.reset === "1" || req.body?.reset === true) {
     try {
       await sock?.logout();
@@ -299,7 +373,6 @@ app.post("/connect", async (req, res) => {
     state = { status: "desconectado", qr: null, phone: null };
   }
   if (!sock?.user) start();
-  // Espera até 20s o QR Code aparecer, para o CRM já receber a imagem pronta.
   for (let i = 0; i < 40 && !state.qr && state.status !== "conectado"; i += 1) {
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -316,6 +389,27 @@ app.post("/disconnect", async (_r, res) => {
   res.json(state);
 });
 
+app.get("/groups", async (_r, res) => {
+  if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
+  try {
+    const all = await sock.groupFetchAllParticipating();
+    const groups = Object.values(all || {}).map((g) => ({
+      jid: g.id,
+      name: g.subject || g.id,
+      size: g.size ?? g.participants?.length ?? 0,
+      announce: Boolean(g.announce),
+      isCommunity: Boolean(g.isCommunity),
+      linkedParent: g.linkedParent || null,
+    }));
+    groups.sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+    res.json({ groups });
+  } catch (e) {
+    console.error("[groups] falhou:", e?.message);
+    res.status(500).json({ error: e?.message || "falha ao listar grupos" });
+  }
+});
+
+
 app.post("/send", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   try {
@@ -329,7 +423,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// Reagir a uma mensagem com emoji, igual ao WhatsApp (emoji vazio remove a reação).
+
 app.post("/send-reaction", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, messageId, emoji, fromMe } = req.body || {};
@@ -342,7 +436,7 @@ app.post("/send-reaction", async (req, res) => {
     });
     res.json({ externalId: sent?.key?.id ?? null });
   } catch (e) {
-    console.error("[send-reaction] falhou:", e?.message);
+    console.error("[send-reactionj�!hou:", e?.message);
     res.status(500).json({ error: e?.message || "falha ao reagir" });
   }
 });
@@ -353,12 +447,10 @@ app.post("/send-document", async (req, res) => {
   if (!to || !filename || !base64) return res.status(400).json({ error: "to, filename e base64 são obrigatórios" });
   try {
     const digits = String(to).replace(/\D/g, "");
-    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
+    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net';
     const buf = Buffer.from(base64, "base64");
     const mime = mimetype || "application/pdf";
     const isAudio = mime.startsWith("audio/");
-    // O WhatsApp só toca áudio em Opus: o navegador grava em webm/opus,
-    // então rotulamos como ogg/opus para virar mensagem de voz nativa.
     const audioMime = "audio/ogg; codecs=opus";
     const sent = await sock.sendMessage(
       jid,
@@ -367,28 +459,24 @@ app.post("/send-document", async (req, res) => {
         : mime.startsWith("video/")
           ? { video: buf, mimetype: mime, caption: caption || undefined }
           : isAudio
-            // ptt:true força mensagem de voz nativa, nunca documento/anexo.
             ? { audio: buf, mimetype: audioMime, ptt: true, fileName: undefined }
             : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
     );
-    res.json({ externalId: sent?.key?.id ?? null });
+    res.json({ `externalId: sent?.key?.id ?? null });
   } catch (e) {
     console.error("[send-document] falhou:", e?.message);
     res.status(500).json({ error: e?.message || "falha ao enviar o anexo" });
   }
 });
 
-// Escuta em TODAS as portas possíveis (PORT do Railway + 8787) para eliminar
-// qualquer desalinhamento entre a porta do aplicativo e a porta do domínio.
 function listenOn(port, label) {
   const server = http.createServer(app);
   server.on("error", (e) => console.log(`[http] ${label}:${port} indisponível —`, e.message));
-  server.listen(port, "0.0.0.0", () => console.log(`Flymax WhatsApp Gateway on :${port} (${label})`));
+  server.listen(port, "0.0.0.0", () => console.log(`Flymax WhatsApp Gateway on ${port} (${label})`));
 }
 listenOn(Number(process.env.PORT) || 8787, "PORT");
 if (Number(process.env.PORT) !== 8787) listenOn(8787, "fixa");
 
-// Nada pode derrubar o servidor HTTP: erros do WhatsApp ficam apenas no log.
 process.on("uncaughtException", (e) => console.error("[erro não tratado]", e?.message));
 process.on("unhandledRejection", (e) => console.error("[promise rejeitada]", e?.message ?? e));
 
