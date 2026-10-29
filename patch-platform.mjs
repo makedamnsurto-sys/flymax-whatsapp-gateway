@@ -13,9 +13,9 @@ content = content.replace(
 );
 if (content !== before) {
   writeFileSync(file, content);
-  console.log("[patch] platforma MACOS aplicada em", file);
+  console.log("[patch] plataforma MACOS aplicada em", file);
 } else if (content.includes("Platform.MACOS")) {
   console.log("[patch] plataforma MACOS já aplicada");
 } else {
-  console.warn("[patch] padr�o não encontrado em", file);
+  console.warn("[patch] padrão não encontrado em", file);
 }
