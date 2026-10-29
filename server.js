@@ -12,6 +12,8 @@
  *   SESSION_DIR    - pasta da sessão (default ./session)
  */
 import http from "http";
+import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
 import fs from "fs";
 import express from "express";
 import qrcode from "qrcode";
@@ -345,7 +347,7 @@ async function post(payload) {
 }
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "40mb" }));
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   if (!CONFIG_OK) return res.status(503).json({ error: "GATEWAY_TOKEN não configurada" });
@@ -437,6 +439,22 @@ app.post("/send-reaction", async (req, res) => {
   }
 });
 
+// Converte WebM/MP4 do navegador em OGG/Opus real (formato de voz do WhatsApp,
+// necessário para tocar no iPhone).
+function toOggOpus(input) {
+  return new Promise((resolve, reject) => {
+    if (!ffmpegPath) return reject(new Error("ffmpeg indisponível"));
+    const p = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"]);
+    const out = []; let err = "";
+    p.stdout.on("data", (d) => out.push(d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("error", reject);
+    p.on("close", (code) => (code === 0 && out.length ? resolve(Buffer.concat(out)) : reject(new Error(err || `ffmpeg ${code}`))));
+    p.stdin.on("error", () => {});
+    p.stdin.end(input);
+  });
+}
+
 app.post("/send-document", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   const { to, filename, base64, caption, mimetype } = req.body || {};
@@ -449,7 +467,17 @@ app.post("/send-document", async (req, res) => {
     const isAudio = mime.startsWith("audio/");
     // O WhatsApp só toca áudio em Opus: o navegador grava em webm/opus,
     // então rotulamos como ogg/opus para virar mensagem de voz nativa.
-    const audioMime = "audio/ogg; codecs=opus";
+    let audioBuf = buf;
+    let audioMime = "audio/ogg; codecs=opus";
+    if (isAudio && !/ogg/i.test(mime)) {
+      try {
+        audioBuf = await toOggOpus(buf);
+      } catch (e) {
+        // Enviar o WebM original chega quebrado no celular do cliente: melhor avisar o atendente.
+        console.error("[send-document] conversão ogg falhou:", e?.message);
+        return res.status(500).json({ error: "não consegui converter o áudio para o formato do WhatsApp — tente gravar de novo" });
+      }
+    }
     const sent = await sock.sendMessage(
       jid,
       mime.startsWith("image/")
@@ -458,7 +486,7 @@ app.post("/send-document", async (req, res) => {
           ? { video: buf, mimetype: mime, caption: caption || undefined }
           : isAudio
             // ptt:true força mensagem de voz nativa, nunca documento/anexo.
-            ? { audio: buf, mimetype: audioMime, ptt: true, fileName: undefined }
+            ? { audio: audioBuf, mimetype: audioMime, ptt: audioMime.includes("ogg"), fileName: undefined }
             : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
     );
     res.json({ externalId: sent?.key?.id ?? null });
