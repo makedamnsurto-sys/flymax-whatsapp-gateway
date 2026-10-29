@@ -439,12 +439,12 @@ app.post("/send-reaction", async (req, res) => {
   }
 });
 
-// Converte WebM/MP4 do navegador em OGG/Opus real (formato de voz do WhatsApp,
-// necessário para tocar no iPhone).
-function toOggOpus(input) {
+// Converte o áudio do navegador (WebM/Opus) em MP4/AAC: o iPhone recusa o
+// Opus gerado pelo ffmpeg em mensagens de voz, mas toca AAC nativamente.
+function toMp4Aac(input) {
   return new Promise((resolve, reject) => {
     if (!ffmpegPath) return reject(new Error("ffmpeg indisponível"));
-    const p = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"]);
+    const p = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "44100", "-c:a", "aac", "-b:a", "64k", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]);
     const out = []; let err = "";
     p.stdout.on("data", (d) => out.push(d));
     p.stderr.on("data", (d) => (err += d));
@@ -465,16 +465,15 @@ app.post("/send-document", async (req, res) => {
     const buf = Buffer.from(base64, "base64");
     const mime = mimetype || "application/pdf";
     const isAudio = mime.startsWith("audio/");
-    // O WhatsApp só toca áudio em Opus: o navegador grava em webm/opus,
-    // então rotulamos como ogg/opus para virar mensagem de voz nativa.
+    // Áudio que não veio do WhatsApp (gravado no navegador) vira MP4/AAC,
+    // formato que toca no iPhone e no Android. Ogg nativo é mantido.
     let audioBuf = buf;
-    let audioMime = "audio/ogg; codecs=opus";
+    let audioMime = /ogg/i.test(mime) ? "audio/ogg; codecs=opus" : "audio/mp4";
     if (isAudio && !/ogg/i.test(mime)) {
       try {
-        audioBuf = await toOggOpus(buf);
+        audioBuf = await toMp4Aac(buf);
       } catch (e) {
-        // Enviar o WebM original chega quebrado no celular do cliente: melhor avisar o atendente.
-        console.error("[send-document] conversão ogg falhou:", e?.message);
+        console.error("[send-document] conversão mp4 falhou:", e?.message);
         return res.status(500).json({ error: "não consegui converter o áudio para o formato do WhatsApp — tente gravar de novo" });
       }
     }
@@ -485,8 +484,8 @@ app.post("/send-document", async (req, res) => {
         : mime.startsWith("video/")
           ? { video: buf, mimetype: mime, caption: caption || undefined }
           : isAudio
-            // ptt:true força mensagem de voz nativa, nunca documento/anexo.
-            ? { audio: audioBuf, mimetype: audioMime, ptt: audioMime.includes("ogg"), fileName: undefined }
+            // ptt:true mostra como mensagem de voz, nunca documento/anexo.
+            ? { audio: audioBuf, mimetype: audioMime, ptt: true, fileName: undefined }
             : { document: buf, mimetype: mime, fileName: filename, caption: caption || undefined },
     );
     res.json({ externalId: sent?.key?.id ?? null });
