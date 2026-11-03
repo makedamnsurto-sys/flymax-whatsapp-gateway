@@ -388,10 +388,20 @@ app.post("/disconnect", async (_r, res) => {
 
 // Lista os grupos (inclusive os da Comunidade Flymax) para o CRM disparar promoções.
 // Só leitura: mensagens de grupo continuam fora do Inbox.
-app.get("/groups", async (_r, res) => {
-  if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
+// Cache de 15 min: o WhatsApp devolve "rate-overlimit" se consultado com frequência.
+const GROUPS_TTL_MS = 15 * 60 * 1000;
+let groupsCache = { at: 0, groups: null };
+let groupsInflight = null;
+app.get("/groups", async (req, res) => {
+  const fresh = groupsCache.groups && Date.now() - groupsCache.at < GROUPS_TTL_MS;
+  if (fresh && req.query.refresh !== "1") return res.json({ groups: groupsCache.groups, cached: true });
+  if (!sock?.user) {
+    if (groupsCache.groups) return res.json({ groups: groupsCache.groups, cached: true, stale: true });
+    return res.status(409).json({ error: "WhatsApp desconectado" });
+  }
   try {
-    const all = await sock.groupFetchAllParticipating();
+    groupsInflight ??= sock.groupFetchAllParticipating().finally(() => { groupsInflight = null; });
+    const all = await groupsInflight;
     const groups = Object.values(all || {}).map((g) => ({
       jid: g.id,
       name: g.subject || g.id,
@@ -401,10 +411,13 @@ app.get("/groups", async (_r, res) => {
       linkedParent: g.linkedParent || null,
     }));
     groups.sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+    groupsCache = { at: Date.now(), groups };
     res.json({ groups });
   } catch (e) {
     console.error("[groups] falhou:", e?.message);
-    res.status(500).json({ error: e?.message || "falha ao listar grupos" });
+    if (groupsCache.groups) return res.json({ groups: groupsCache.groups, cached: true, stale: true });
+    const limited = /rate-overlimit/i.test(e?.message || "");
+    res.status(limited ? 429 : 500).json({ error: limited ? "O WhatsApp limitou a consulta de grupos. Tente de novo em alguns minutos." : e?.message || "falha ao listar grupos" });
   }
 });
 
