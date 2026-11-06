@@ -181,7 +181,18 @@ async function toInbound(m) {
   }
   const jid = messageJid(m.key);
   const from = jid.split("@")[0];
+  const ctxInfo = Object.values(msg).find((v) => v && typeof v === "object" && v.contextInfo)?.contextInfo;
+  const qm = ctxInfo?.quotedMessage;
+  const quotedText = qm
+    ? qm.conversation || qm.extendedTextMessage?.text || qm.imageMessage?.caption || qm.videoMessage?.caption ||
+      (qm.imageMessage ? "📷 Imagem" : qm.videoMessage ? "🎬 Vídeo" : qm.audioMessage ? "🎤 Áudio" : qm.documentMessage ? `📄 ${qm.documentMessage.fileName || "Documento"}` : "Mensagem")
+    : null;
+  const myNum = String(sock?.user?.id || "").split(":")[0].split("@")[0];
+  const quoted = ctxInfo?.stanzaId
+    ? { id: ctxInfo.stanzaId, body: quotedText, fromMe: Boolean(myNum && String(ctxInfo.participant || "").startsWith(myNum)) }
+    : null;
   const base = {
+    quoted,
     from,
     jid,
     name: m.pushName || undefined,
@@ -424,9 +435,12 @@ app.get("/groups", async (req, res) => {
 app.post("/send", async (req, res) => {
   if (!sock?.user) return res.status(409).json({ error: "WhatsApp desconectado" });
   try {
-    const { to, text } = req.body || {};
+    const { to, text, quoted } = req.body || {};
     const jid = String(to).includes("@") ? String(to) : `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
-    const sent = await sock.sendMessage(jid, { text });
+    const opts = quoted?.id
+      ? { quoted: { key: { remoteJid: jid, id: quoted.id, fromMe: Boolean(quoted.fromMe) }, message: { conversation: quoted.body || "" } } }
+      : undefined;
+    const sent = await sock.sendMessage(jid, { text }, opts);
     res.json({ externalId: sent?.key?.id ?? null });
   } catch (e) {
     console.error("[send] falhou:", e?.message);
